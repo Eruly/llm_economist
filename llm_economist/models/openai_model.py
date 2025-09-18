@@ -76,16 +76,31 @@ class OpenAIModel(BaseLLMModel):
                 response = self.client.chat.completions.create(**request_params)
                 
                 message = response.choices[0].message.content
-                
+
                 if not self._validate_response(message):
                     self.logger.warning(f"Invalid response received: {message}")
                     retry_count += 1
                     continue
-                
-                # Extract JSON if requested
+
                 if json_format:
-                    return self._extract_json(message)
-                
+                    parsed_response, is_json_valid = self._extract_json(message)
+                    self._record_history(
+                        system_prompt,
+                        user_prompt,
+                        message,
+                        json_requested=True,
+                        is_json_valid=is_json_valid,
+                        parsed_response=parsed_response,
+                    )
+                    return parsed_response, is_json_valid
+
+                self._record_history(
+                    system_prompt,
+                    user_prompt,
+                    message,
+                    json_requested=False,
+                    is_json_valid=False,
+                )
                 return message, False
                 
             except RateLimitError as e:

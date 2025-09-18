@@ -8,13 +8,13 @@ import os
 import sys
 import concurrent.futures
 import torch.multiprocessing as mp
-import wandb
+import trackio as wandb
 import random
 import numpy as np
 import time
 from .utils.common import distribute_agents, count_votes, rGB2, GEN_ROLE_MESSAGES
 from .agents.worker import Worker, FixedWorker, distribute_personas
-from .agents.llm_agent import TestAgent
+from .agents.llm_agent import LLMAgent, TestAgent
 from .agents.planner import TaxPlanner, FixedTaxPlanner
 
 
@@ -121,7 +121,18 @@ def run_simulation(args):
         )
     
     start_time = time.time()
-    
+
+    llm_entities = [
+        agent for agent in agents
+        if isinstance(agent, LLMAgent) and getattr(agent, 'llm', None) is not None
+    ]
+    if isinstance(tax_planner, LLMAgent) and getattr(tax_planner, 'llm', None) is not None:
+        llm_entities.append(tax_planner)
+
+    def save_histories_if_due(timestep: int, *, force: bool = False) -> None:
+        for entity in llm_entities:
+            entity.maybe_save_history(timestep, force=force)
+
     # Main simulation loop
     for k in range(args.max_timesteps):
         logger.info(f"TIMESTEP {k}")
@@ -244,7 +255,11 @@ def run_simulation(args):
         remaining_time = (args.max_timesteps - k - 1) * iteration_time / (k + 1)
         logger.info(f"Time remaining {k+2}-{args.max_timesteps}: {remaining_time:.5f} seconds")
 
+        save_histories_if_due(k)
+
     logger.info("Simulation completed successfully!")
+
+    save_histories_if_due(args.max_timesteps - 1, force=True)
     
     if args.wandb:
         wandb.finish()
@@ -297,6 +312,14 @@ def create_argument_parser():
     parser.add_argument('--planner-type', default='LLM', choices=['LLM', 'US_FED', 'SAEZ', 'SAEZ_THREE', 'SAEZ_FLAT', 'UNIFORM'], help='Type of tax planner')
     parser.add_argument('--max-timesteps', type=int, default=1000, help='Maximum number of timesteps for the simulation')
     parser.add_argument('--history-len', type=int, default=50, help='Length of history to consider')
+    parser.add_argument('--history-jsonl-load', type=str, default=None,
+                        help='Path (file or directory) to load LLM history JSONL data from')
+    parser.add_argument('--history-jsonl-step', type=int, default=None,
+                        help='Restore history up to the specified step when loading')
+    parser.add_argument('--history-jsonl-save', type=str, default=None,
+                        help='Path (file or directory) to save LLM history JSONL data to')
+    parser.add_argument('--history-save-interval', type=int, default=0,
+                        help='Save history every N timesteps; 0 disables periodic saves')
     parser.add_argument('--two-timescale', type=int, default=25, help='Interval for two-timescale updates')
     parser.add_argument('--debug', type=bool, default=True, help='Enable debug mode') 
     parser.add_argument('--llm', default='llama3:8b', type=str, help='Language model to use')

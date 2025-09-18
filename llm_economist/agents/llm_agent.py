@@ -1,5 +1,7 @@
 import logging
+from pathlib import Path
 from time import sleep
+from typing import Optional
 from ..utils.common import Message
 import json
 from ..models.openai_model import OpenAIModel
@@ -39,6 +41,12 @@ class LLMAgent:
         self.prompt_algo = prompt_algo
         self.K = K  # depth of prompt trees
 
+        self.history_save_path: Optional[str] = None
+        self.history_save_interval: int = 0
+        self.history_load_path: Optional[str] = None
+        self.history_load_step: Optional[int] = None
+        self._configure_history_persistence(args)
+
     def _create_llm_model(self, llm_type: str, port: int, args):
         """Create the appropriate LLM model based on the type."""
         if llm_type == 'None':
@@ -58,6 +66,76 @@ class LLMAgent:
                 return VLLMModel(model_name=llm_type, base_url=f"http://localhost:{port}")
         else:
             raise ValueError(f"Invalid LLM type: {llm_type}")
+
+    def _resolve_history_path(self, pattern: Optional[str], *, for_save: bool) -> Optional[str]:
+        if not pattern:
+            return None
+
+        resolved = pattern.replace('{agent}', self.name)
+        path = Path(resolved).expanduser()
+
+        if path.suffix.lower() != '.jsonl':
+            path = path / f"{self.name}.jsonl"
+        elif '{agent}' not in pattern:
+            candidate = path.with_name(f"{path.stem}_{self.name}{path.suffix}")
+            if for_save:
+                path = candidate
+            else:
+                if candidate.exists():
+                    path = candidate
+                elif path.exists():
+                    path = path
+                else:
+                    path = candidate
+
+        if for_save:
+            path.parent.mkdir(parents=True, exist_ok=True)
+
+        return str(path)
+
+    def _configure_history_persistence(self, args) -> None:
+        if self.llm is None or self.name == 'TestAgent':
+            return
+
+        self.history_save_interval = max(0, getattr(args, 'history_save_interval', 0) or 0)
+        self.history_load_step = getattr(args, 'history_jsonl_step', None)
+
+        self.history_load_path = self._resolve_history_path(getattr(args, 'history_jsonl_load', None), for_save=False)
+        self.history_save_path = self._resolve_history_path(getattr(args, 'history_jsonl_save', None), for_save=True)
+
+        if self.history_save_path:
+            self.logger.info(f"[{self.name}] History persistence enabled: {self.history_save_path}")
+
+        if self.history_load_path:
+            try:
+                self.llm.load_history_jsonl(self.history_load_path, upto_step=self.history_load_step)
+                suffix = '' if self.history_load_step is None else f" up to step {self.history_load_step}"
+                self.logger.info(f"[{self.name}] Loaded history from {self.history_load_path}{suffix}")
+            except (FileNotFoundError, IndexError) as exc:
+                msg = f"[{self.name}] Failed to load history from {self.history_load_path}: {exc}"
+                self.logger.error(msg)
+                raise
+            except Exception as exc:
+                self.logger.error(f"[{self.name}] Unexpected error loading history: {exc}")
+                raise
+
+    def maybe_save_history(self, timestep: int, *, force: bool = False) -> None:
+        if self.llm is None or self.history_save_path is None:
+            return
+
+        should_save = force
+        if not should_save and self.history_save_interval > 0:
+            should_save = (timestep + 1) % self.history_save_interval == 0
+
+        if not should_save:
+            return
+
+        try:
+            self.llm.save_history_jsonl(self.history_save_path)
+            if force or self.history_save_interval:
+                self.logger.info(f"[{self.name}] Saved history to {self.history_save_path}")
+        except Exception as exc:
+            self.logger.error(f"[{self.name}] Failed to save history to {self.history_save_path}: {exc}")
 
     def act(self) -> str:
         raise NotImplementedError

@@ -2,6 +2,64 @@
 Tests for the main simulation functionality.
 """
 
+import sys
+from types import ModuleType
+
+if "trackio" not in sys.modules:
+    mock_trackio = ModuleType("trackio")
+    mock_trackio.init = lambda *_, **__: None
+    mock_trackio.log = lambda *_, **__: None
+    mock_trackio.finish = lambda *_, **__: None
+    sys.modules["trackio"] = mock_trackio
+
+if "openai" not in sys.modules:
+    mock_openai = ModuleType("openai")
+
+    class _MockOpenAI:
+        def __init__(self, *_, **__):
+            pass
+
+        class chat:
+            class completions:
+                @staticmethod
+                def create(**kwargs):
+                    raise RuntimeError("Mock OpenAI called during tests")
+
+    class RateLimitError(Exception):
+        pass
+
+    mock_openai.OpenAI = _MockOpenAI
+    mock_openai.RateLimitError = RateLimitError
+    sys.modules["openai"] = mock_openai
+
+if "scipy" not in sys.modules:
+    import numpy as _np
+
+    mock_stats = ModuleType("stats")
+
+    class _MockF:
+        @staticmethod
+        def ppf(p, d1, d2):
+            arr = _np.asarray(p, dtype=float)
+            if arr.shape == ():
+                arr = _np.array([arr])
+            return _np.ones_like(arr, dtype=float)
+
+    class _MockKDE:
+        def __init__(self, data):
+            self.data = _np.asarray(data, dtype=float)
+
+        def __call__(self, x):
+            return _np.ones(1, dtype=float)
+
+    mock_stats.f = _MockF()
+    mock_stats.gaussian_kde = lambda data: _MockKDE(data)
+
+    mock_scipy = ModuleType("scipy")
+    mock_scipy.stats = mock_stats
+    sys.modules["scipy"] = mock_scipy
+    sys.modules["scipy.stats"] = mock_stats
+
 import pytest
 from unittest.mock import Mock, patch, MagicMock
 from llm_economist.main import run_simulation, generate_experiment_name, create_argument_parser
@@ -82,6 +140,10 @@ class TestArgumentParser:
         assert args.prompt_algo == "io"
         assert args.history_len == 50
         assert args.two_timescale == 25
+        assert args.history_jsonl_load is None
+        assert args.history_jsonl_step is None
+        assert args.history_jsonl_save is None
+        assert args.history_save_interval == 0
     
     def test_custom_arguments(self):
         """Test parsing custom arguments."""
