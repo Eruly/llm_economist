@@ -27,6 +27,9 @@ class BaseLLMModel(ABC):
         self.logger = logging.getLogger(__name__)
         self.stop_tokens = ['}']
         self.history: List[Dict[str, Any]] = []
+        self._replay_enabled: bool = False
+        self._replay_cursor: int = 0
+        self._replay_limit: int = -1
         
     @abstractmethod
     def send_msg(self, system_prompt: str, user_prompt: str, 
@@ -125,6 +128,8 @@ class BaseLLMModel(ABC):
         if not path.exists():
             raise FileNotFoundError(f"History file not found: {filepath}")
 
+        self.disable_history_replay()
+
         loaded: List[Dict[str, Any]] = []
         with path.open("r", encoding="utf-8") as fh:
             for line in fh:
@@ -156,3 +161,82 @@ class BaseLLMModel(ABC):
         entry = self.get_history_step(step)
         self.history = self.history[: step + 1]
         return entry
+
+    # -- History replay helpers -------------------------------------------------
+
+    def disable_history_replay(self) -> None:
+        """Turn off replay mode and reset internal state."""
+
+        self._replay_enabled = False
+        self._replay_cursor = 0
+        self._replay_limit = -1
+
+    def enable_history_replay(self, upto_step: Optional[int] = None) -> None:
+        """Enable replaying previously recorded history entries.
+
+        Args:
+            upto_step: Highest step index to replay (inclusive). If ``None`` the
+                entire currently loaded history will be replayed.
+        """
+
+        if not self.history:
+            raise ValueError("Cannot enable history replay without any loaded history.")
+
+        if upto_step is None:
+            limit = len(self.history) - 1
+        else:
+            if upto_step < 0 or upto_step >= len(self.history):
+                raise IndexError(
+                    f"Requested replay step {upto_step} is out of range for history length {len(self.history)}"
+                )
+            limit = upto_step
+
+        self._replay_cursor = 0
+        self._replay_limit = limit
+        self._replay_enabled = True
+
+    def has_pending_replay(self) -> bool:
+        """Return whether there are replay steps queued."""
+
+        return self._replay_enabled and self._replay_cursor <= self._replay_limit
+
+    def consume_history_replay(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        json_format: bool,
+    ) -> Optional[Tuple[str, bool]]:
+        """Return the next recorded response if replay mode is active.
+
+        Args:
+            system_prompt: Prompt expected for the current step.
+            user_prompt: Prompt expected for the current step.
+            json_format: Whether the caller expects a JSON-formatted response.
+
+        Returns:
+            A tuple of (response_text, is_json_valid) if a replay entry was
+            consumed; otherwise ``None``.
+        """
+
+        if not self.has_pending_replay():
+            return None
+
+        entry = self.history[self._replay_cursor]
+        if entry.get("system_prompt") != system_prompt or entry.get("user_prompt") != user_prompt:
+            self.logger.warning(
+                "History replay mismatch at step %s. Expected prompts do not match recorded prompts; disabling replay.",
+                self._replay_cursor,
+            )
+            self.disable_history_replay()
+            return None
+
+        self._replay_cursor += 1
+        if self._replay_cursor > self._replay_limit:
+            self.disable_history_replay()
+
+        if json_format:
+            payload = entry.get("parsed_response") or entry.get("response", "")
+            return payload, entry.get("is_json_valid", False)
+
+        return entry.get("response", ""), entry.get("is_json_valid", False)

@@ -230,8 +230,8 @@ def main():
     parser.add_argument("--port", type=int, default=8000,
                         help="Port for local LLM server")
     parser.add_argument("--service", type=str, default="vllm",
-                        choices=["vllm", "ollama"],
-                        help="Local LLM service")
+                        choices=["vllm", "ollama", "openai", "openrouter", "gemini"],
+                        help="Backend service providing the LLM")
     
     # Bounded rationality parameters
     parser.add_argument("--percent-ego", type=int, default=100,

@@ -81,7 +81,10 @@ class DummyLLM(BaseLLMModel):
 
     def load_history_jsonl(self, filepath: str, upto_step=None):
         self.loaded_path = filepath
-        return []
+        try:
+            return super().load_history_jsonl(filepath, upto_step=upto_step)
+        except FileNotFoundError:
+            return []
 
 
 class DummyAgent(LLMAgent):
@@ -133,3 +136,15 @@ def test_history_load_legacy_file(tmp_path):
     args = make_args(history_load=legacy_file)
     agent = DummyAgent("worker_3", args)
     assert agent.llm.loaded_path == str(legacy_file)
+
+
+def test_history_load_directory(tmp_path):
+    history_dir = tmp_path / "histories"
+    history_dir.mkdir()
+    agent_file = history_dir / "worker_4.jsonl"
+    agent_file.write_text("")
+
+    args = make_args(history_load=history_dir)
+    agent = DummyAgent("worker_4", args)
+    assert Path(agent.history_load_path) == agent_file
+    assert agent.llm.loaded_path == str(agent_file)

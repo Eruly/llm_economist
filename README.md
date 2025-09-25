@@ -119,6 +119,14 @@ python -m llm_economist.main --llm anthropic/claude-3.5-sonnet --use-openrouter
 python -m llm_economist.main --llm gemini-1.5-flash
 ```
 
+### 4. Launch the Interactive Web UI
+
+```bash
+streamlit run streamlit_app.py
+```
+
+The Streamlit interface lets you tweak the main simulation parameters, launch runs, and monitor the live console output in your browser. Saved configurations are kept in the sidebar so you can quickly rerun previous experiments.
+
 ## 🏗️ Project Structure
 
 ```

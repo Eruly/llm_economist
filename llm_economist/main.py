@@ -16,7 +16,9 @@ from .utils.common import distribute_agents, count_votes, rGB2, GEN_ROLE_MESSAGE
 from .agents.worker import Worker, FixedWorker, distribute_personas
 from .agents.llm_agent import LLMAgent, TestAgent
 from .agents.planner import TaxPlanner, FixedTaxPlanner
+from dotenv import load_dotenv
 
+load_dotenv()
 
 def setup_logging(args):
     """Setup logging configuration."""
@@ -121,6 +123,13 @@ def run_simulation(args):
         )
     
     start_time = time.time()
+
+    wandb_step_offset = 0
+    if getattr(args, 'history_jsonl_step', None) is not None:
+        try:
+            wandb_step_offset = max(0, int(args.history_jsonl_step) + 1)
+        except (TypeError, ValueError):
+            wandb_step_offset = 0
 
     llm_entities = [
         agent for agent in agents
@@ -239,7 +248,7 @@ def run_simulation(args):
         tax_planner.log_stats(k, wandb_logger, z=pre_tax_incomes, u=u, debug=args.debug)
         
         if args.wandb:
-            wandb.log(wandb_logger)
+            wandb.log(wandb_logger, step=wandb_step_offset + k)
             
         end_time = time.time()
         iteration_time = end_time - start_time
@@ -335,7 +344,11 @@ def create_argument_parser():
     parser.add_argument('--name', type=str, default='', help='Experiment name')
     parser.add_argument('--log-dir', type=str, default='logs', help='Directory for log files')
     parser.add_argument('--bracket-setting', default='three', choices=['flat', 'three', 'US_FED'])
-    parser.add_argument('--service', default='vllm', choices=['vllm', 'ollama'])
+    parser.add_argument(
+        '--service',
+        default='vllm',
+        choices=['vllm', 'ollama', 'openai', 'openrouter', 'gemini'],
+    )
     parser.add_argument('--use-multithreading', action='store_true')
     parser.add_argument('--warmup', default=0, type=int)
     parser.add_argument('--elasticity', nargs='+', type=float, default=[0.4], 
@@ -378,5 +391,6 @@ def main():
 
 
 if __name__ == '__main__':
+    load_dotenv()
     mp.set_start_method('spawn', force=True)
     main() 

@@ -90,6 +90,11 @@ class LLMAgent:
 
         if for_save:
             path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            if not path.exists() and path.parent.exists():
+                candidates = sorted(path.parent.glob(f"*{self.name}*.jsonl"))
+                if candidates:
+                    path = candidates[0]
 
         return str(path)
 
@@ -109,6 +114,13 @@ class LLMAgent:
         if self.history_load_path:
             try:
                 self.llm.load_history_jsonl(self.history_load_path, upto_step=self.history_load_step)
+                if getattr(self.llm, "history", None):
+                    try:
+                        self.llm.enable_history_replay(upto_step=self.history_load_step)
+                    except (ValueError, IndexError) as exc:
+                        self.logger.warning(
+                            f"[{self.name}] Unable to enable history replay: {exc}"
+                        )
                 suffix = '' if self.history_load_step is None else f" up to step {self.history_load_step}"
                 self.logger.info(f"[{self.name}] Loaded history from {self.history_load_path}{suffix}")
             except (FileNotFoundError, IndexError) as exc:
@@ -212,10 +224,18 @@ class LLMAgent:
     def call_llm(self, msg: str, timestep: int, keys: list[str], parse_func, depth: int=0, retry: bool=False, cot: bool=False, temperature: float=0.7) -> list[float]:
         response_found = False
         if cot:
-            llm_output, response_found = self.llm.send_msg(self.system_prompt, msg, temperature=temperature, json_format=True)
+            llm_output, response_found = self._send_or_replay(
+                msg,
+                json_format=True,
+                temperature=temperature,
+            )
             msg = msg + llm_output
         if not response_found:
-            llm_output, _ = self.llm.send_msg(self.system_prompt, msg + '\n{"', temperature=temperature, json_format=True)
+            llm_output, _ = self._send_or_replay(
+                msg + '\n{"',
+                json_format=True,
+                temperature=temperature,
+            )
         try:
             self.logger.info(f"LLM OUTPUT RECURSE {depth}\t{llm_output.strip()}")
             # parse for json braces {}
@@ -230,6 +250,23 @@ class LLMAgent:
             else:
                 raise ValueError(f"Max recursion depth={depth} reached. Error parsing JSON: " + str(e))
         return output
+
+    def _send_or_replay(self, user_prompt: str, *, json_format: bool, temperature: float) -> tuple[str, bool]:
+        if hasattr(self.llm, "consume_history_replay"):
+            replay_result = self.llm.consume_history_replay(
+                system_prompt=self.system_prompt,
+                user_prompt=user_prompt,
+                json_format=json_format,
+            )
+            if replay_result is not None:
+                return replay_result
+
+        return self.llm.send_msg(
+            self.system_prompt,
+            user_prompt,
+            temperature=temperature,
+            json_format=json_format,
+        )
     
     # prompting
     def prompt_io(self, msg: str, timestep: int, keys: list[str], parse_func) -> list[float]:

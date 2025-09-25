@@ -98,3 +98,47 @@ def test_json_history_record(tmp_path):
     assert entry["json_requested"] is True
     assert entry["is_json_valid"] is True
     assert entry["parsed_response"] == response
+
+
+def test_history_replay_consumes_entries(tmp_path):
+    model = DummyModel()
+    model.send_msg("sys", "step0")
+    model.send_msg("sys", "step1")
+
+    out_file = tmp_path / "history.jsonl"
+    model.save_history_jsonl(str(out_file))
+
+    replay_model = DummyModel()
+    replay_model.load_history_jsonl(str(out_file))
+    replay_model.enable_history_replay()
+
+    first = replay_model.consume_history_replay(system_prompt="sys", user_prompt="step0", json_format=False)
+    assert first == ("resp:step0", False)
+
+    second = replay_model.consume_history_replay(system_prompt="sys", user_prompt="step1", json_format=False)
+    assert second == ("resp:step1", False)
+
+    # Exhausted replay should return None
+    assert replay_model.consume_history_replay(system_prompt="sys", user_prompt="step1", json_format=False) is None
+
+
+def test_history_replay_mismatch_disables(tmp_path):
+    model = DummyModel()
+    model.send_msg("sys", "expected")
+
+    out_file = tmp_path / "history.jsonl"
+    model.save_history_jsonl(str(out_file))
+
+    replay_model = DummyModel()
+    replay_model.load_history_jsonl(str(out_file))
+    replay_model.enable_history_replay()
+
+    assert (
+        replay_model.consume_history_replay(system_prompt="sys", user_prompt="wrong", json_format=False)
+        is None
+    )
+
+    # Replay disabled after mismatch; enabling again works
+    replay_model.enable_history_replay()
+    entry = replay_model.consume_history_replay(system_prompt="sys", user_prompt="expected", json_format=False)
+    assert entry == ("resp:expected", False)
