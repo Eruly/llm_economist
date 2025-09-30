@@ -5,6 +5,8 @@ import json
 import re
 import shlex
 import subprocess
+import uuid
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -12,6 +14,7 @@ import streamlit as st
 
 ROOT_DIR = Path(__file__).resolve().parent
 DEFAULT_LOG_DIR = ROOT_DIR / "logs"
+HISTORY_CACHE_DIR = ROOT_DIR / ".streamlit_history_cache"
 
 STORED_ARG_KEYS: Tuple[str, ...] = (
     "num_agents",
@@ -225,25 +228,267 @@ def file_picker(
     return st.session_state.get(text_key, "")
 
 
+def _normalise_step(value: Any, fallback: int) -> int:
+    """Return ``value`` as an integer step, falling back when invalid."""
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _normalise_history_entries(raw_entries: List[Any]) -> List[Dict[str, Any]]:
+    """Ensure every history entry is a dict with a valid ``step`` field."""
+
+    normalised: List[Dict[str, Any]] = []
+    for idx, item in enumerate(raw_entries):
+        if not isinstance(item, dict):
+            continue
+        entry = dict(item)
+        entry["step"] = _normalise_step(entry.get("step"), idx)
+        normalised.append(entry)
+    return normalised
+
+
 @st.cache_data(show_spinner=False)
-def load_history_entries(file_path: str) -> List[Dict[str, Any]]:
-    """Load JSONL entries for a single agent history file."""
+def load_history_file(file_path: str) -> Optional[Dict[str, Any]]:
+    """Load a history file (JSONL or JSON) and return a structured payload."""
 
     path = Path(file_path).expanduser()
-    if not path.exists():
-        return []
+    if not path.exists() or not path.is_file():
+        return None
 
-    entries: List[Dict[str, Any]] = []
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entries.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    return entries
+    suffix = path.suffix.lower()
+    payload: Dict[str, Any] = {
+        "entries": [],
+        "format": "unknown",
+        "raw": None,
+        "source": str(path),
+    }
+
+    if suffix == ".jsonl":
+        entries: List[Dict[str, Any]] = []
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    record.setdefault("step", len(entries))
+                    entries.append(record)
+        payload.update({
+            "entries": entries,
+            "format": "jsonl",
+        })
+        return payload
+
+    if suffix != ".json":
+        return None
+
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    # Modern structure: {"messages": [...], "llm_history": [...]}
+    if isinstance(data, dict):
+        llm_history = data.get("llm_history") if isinstance(data.get("llm_history"), list) else None
+        messages = data.get("messages") if isinstance(data.get("messages"), list) else None
+
+        if llm_history:
+            entries = _normalise_history_entries(llm_history)
+            payload.update({
+                "entries": entries,
+                "format": "json_messages",
+                "raw": data,
+            })
+            return payload
+
+        if messages:
+            derived: List[Dict[str, Any]] = []
+            for idx, item in enumerate(messages):
+                if not isinstance(item, dict):
+                    continue
+                entry = dict(item)
+                entry["step"] = _normalise_step(entry.get("timestep"), idx)
+                derived.append(entry)
+            payload.update({
+                "entries": derived,
+                "format": "json_messages",
+                "raw": data,
+            })
+            return payload
+
+        payload.update({
+            "entries": [],
+            "format": "json",
+            "raw": data,
+        })
+        return payload
+
+    if isinstance(data, list):
+        entries = _normalise_history_entries(data)
+        payload.update({
+            "entries": entries,
+            "format": "json_list",
+            "raw": data,
+        })
+        return payload
+
+    return None
+
+
+def load_history_entries(file_path: str) -> List[Dict[str, Any]]:
+    """Backward-compatible helper that returns only the normalised entries."""
+
+    payload = load_history_file(file_path)
+    if not payload:
+        return []
+    return list(payload.get("entries", []))
+
+
+def gather_history_directory(directory: Path) -> Tuple[int, Dict[str, Dict[str, Any]]]:
+    """Return the maximum entry count and cached payloads for a history directory."""
+
+    max_entries = 0
+    cached_entries: Dict[str, Dict[str, Any]] = {}
+
+    for file_path in sorted(directory.iterdir()):
+        if not file_path.is_file() or file_path.suffix.lower() not in {".jsonl", ".json"}:
+            continue
+
+        payload = load_history_file(str(file_path))
+        if not payload:
+            continue
+
+        entries = payload.get("entries", [])
+        if not entries:
+            continue
+
+        cached_entries[file_path.name] = {
+            "entries": entries,
+            "format": payload.get("format", "unknown"),
+            "raw": payload.get("raw"),
+            "source": payload.get("source", str(file_path)),
+        }
+        if len(entries) > max_entries:
+            max_entries = len(entries)
+
+    return max_entries, cached_entries
+
+
+def _blank_history_entry(step: int) -> Dict[str, Any]:
+    """Create a placeholder history entry used when a step is missing."""
+
+    return {
+        "step": step,
+        "system_prompt": "",
+        "user_prompt": "",
+        "response": "",
+        "json_requested": False,
+        "is_json_valid": False,
+        "parsed_response": "",
+    }
+
+
+def prepare_history_subset(
+    source_dir: Path,
+    entries_map: Dict[str, Dict[str, Any]],
+    upto_step: int,
+) -> Optional[Path]:
+    """Materialize a step-limited view of cached history entries for replay.
+
+    Args:
+        source_dir: Original directory provided by the user.
+        entries_map: Mapping of filename to history entries for the directory.
+        upto_step: Zero-based step index to retain (inclusive).
+
+    Returns:
+        Path to the generated directory containing truncated histories, or
+        ``None`` if there is no data to materialize.
+    """
+
+    if upto_step < 0 or not entries_map:
+        return None
+
+    HISTORY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    replay_dir = HISTORY_CACHE_DIR / f"replay_{source_dir.name}_{upto_step}_{uuid.uuid4().hex}"
+    replay_dir.mkdir(parents=True, exist_ok=False)
+
+    for filename, payload in entries_map.items():
+        entries = list(payload.get("entries", []))
+        fmt = payload.get("format")
+        raw_data = payload.get("raw")
+        suffix = Path(filename).suffix.lower()
+        target_path = replay_dir / filename
+
+        max_index = upto_step
+
+        def _iter_truncated_entries() -> List[Dict[str, Any]]:
+            truncated: List[Dict[str, Any]] = []
+            for idx in range(max_index + 1):
+                if idx < len(entries):
+                    record = dict(entries[idx])
+                else:
+                    record = _blank_history_entry(idx)
+                record["step"] = idx
+                record.setdefault("system_prompt", "")
+                record.setdefault("user_prompt", "")
+                record.setdefault("response", "")
+                record.setdefault("json_requested", False)
+                record.setdefault("is_json_valid", False)
+                record.setdefault("parsed_response", "")
+                truncated.append(record)
+            return truncated
+
+        truncated_entries = _iter_truncated_entries()
+
+        if suffix == ".jsonl":
+            with target_path.open("w", encoding="utf-8") as handle:
+                for record in truncated_entries:
+                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            continue
+
+        if suffix == ".json" and fmt == "json_messages" and isinstance(raw_data, dict):
+            truncated_payload = deepcopy(raw_data)
+
+            truncated_payload["llm_history"] = truncated_entries
+
+            messages = truncated_payload.get("messages")
+            if isinstance(messages, list):
+                filtered_messages: List[Dict[str, Any]] = []
+                for item in messages:
+                    if not isinstance(item, dict):
+                        continue
+                    step_val = _normalise_step(item.get("timestep"), _normalise_step(item.get("step"), 0))
+                    if step_val <= upto_step:
+                        filtered_messages.append(dict(item))
+                truncated_payload["messages"] = filtered_messages
+
+            with target_path.open("w", encoding="utf-8") as handle:
+                json.dump(truncated_payload, handle, ensure_ascii=False, indent=2)
+
+            # Provide a JSONL fallback for replay when the original directory lacked one.
+            if filename.endswith("_messages.json"):
+                fallback_name = filename.replace("_messages.json", ".jsonl")
+                if fallback_name not in entries_map:
+                    fallback_path = replay_dir / fallback_name
+                    with fallback_path.open("w", encoding="utf-8") as handle:
+                        for record in truncated_entries:
+                            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            continue
+
+        if suffix == ".json":
+            with target_path.open("w", encoding="utf-8") as handle:
+                json.dump(truncated_entries, handle, ensure_ascii=False, indent=2)
+            continue
+
+    return replay_dir
 
 
 def build_step_index(entries: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
@@ -367,7 +612,10 @@ def build_interaction_graph(planner_label: str, planner_payload: Any, worker_pay
 
     for worker_name, payload in worker_payloads.items():
         node_id = sanitize_node_id(worker_name)
-        worker_label = worker_name.replace(".jsonl", "")
+        worker_path = Path(worker_name)
+        worker_label = worker_path.stem
+        if worker_label.endswith("_messages"):
+            worker_label = worker_label[: -len("_messages")]
         lines.append(f'    {node_id} [label="{graphviz_escape(worker_label)}", fillcolor="#56CCF2"];')
 
         if planner_edge_label:
@@ -473,8 +721,8 @@ def run_simulation(arg_map: Dict[str, object]) -> None:
     except (TypeError, ValueError):
         first_visible_candidate = None
 
-    if first_visible_candidate is not None and first_visible_candidate >= 0:
-        first_visible_step = first_visible_candidate + 1
+    if first_visible_candidate is not None and first_visible_candidate > 0:
+        first_visible_step = first_visible_candidate
     else:
         first_visible_step = None
 
@@ -639,7 +887,7 @@ with tab_runner:
 
         with col18:
             history_jsonl_load = file_picker(
-                "History JSONL load path",
+                "History load path",
                 "history_jsonl_load",
                 default_path=st.session_state.get("__history_jsonl_load", "") or "",
                 mode="open_directory",
@@ -647,38 +895,50 @@ with tab_runner:
             )
 
             candidate = Path(history_jsonl_load).expanduser() if history_jsonl_load else None
+            cache_key = "__history_jsonl_cache"
+
             if candidate and candidate.is_dir():
-                jsonl_files = sorted(candidate.glob("*.jsonl"))
-                if not jsonl_files:
-                    history_load_error = "Selected directory does not contain any .jsonl files."
-                else:
-                    counts: List[int] = []
-                    try:
-                        for file in jsonl_files:
-                            with file.open("r", encoding="utf-8") as handle:
-                                counts.append(sum(1 for line in handle if line.strip()))
-                    except OSError as exc:
-                        history_load_error = f"Failed to read history directory: {exc}"
-                    else:
-                        if counts:
-                            history_entry_count = min(counts)
-            elif candidate and candidate.is_file():
                 try:
-                    with candidate.open("r", encoding="utf-8") as handle:
-                        history_entry_count = sum(1 for line in handle if line.strip())
+                    max_entries, cached = gather_history_directory(candidate)
                 except OSError as exc:
-                    history_load_error = f"Failed to read history: {exc}"
+                    history_load_error = f"Failed to read history directory: {exc}"
+                    st.session_state.pop(cache_key, None)
+                else:
+                    if not cached:
+                        history_load_error = (
+                            "Selected directory does not contain any recognised .json/.jsonl history files."
+                        )
+                        st.session_state.pop(cache_key, None)
+                    else:
+                        resolved_path = str(candidate.resolve())
+                        st.session_state[cache_key] = {
+                            "path": resolved_path,
+                            "entries": cached,
+                        }
+                        history_entry_count = max_entries
+            elif candidate and candidate.is_file():
+                payload = load_history_file(str(candidate))
+                if payload and payload.get("entries"):
+                    history_entry_count = len(payload["entries"])
+                else:
+                    history_load_error = "Selected file does not contain a replayable history."
+                st.session_state.pop(cache_key, None)
             elif candidate and not candidate.exists():
                 history_load_error = "Selected path does not exist."
+                st.session_state.pop(cache_key, None)
+            else:
+                st.session_state.pop(cache_key, None)
 
             if history_load_error:
                 st.error(history_load_error)
             elif history_entry_count is not None:
-                st.caption(f"Detected at least {history_entry_count} step entries in the selected history.")
+                st.caption(
+                    f"Detected up to {history_entry_count} step entries in the selected history."
+                )
 
         with col19:
             history_jsonl_save = file_picker(
-                "History JSONL save path",
+                "History save path",
                 "history_jsonl_save",
                 default_path=st.session_state.get("__history_jsonl_save", "") or "",
                 mode="save_file",
@@ -691,16 +951,20 @@ with tab_runner:
             widget_key = "__history_jsonl_step_widget"
 
             if history_entry_count and history_entry_count > 0:
-                previous_step = st.session_state.get("__history_jsonl_step")
-                if not isinstance(previous_step, int) or previous_step < 1:
-                    previous_step = history_entry_count
-                previous_step = min(previous_step, history_entry_count)
+                stored_widget_value = st.session_state.get(widget_key)
+                if isinstance(stored_widget_value, int):
+                    previous_step = max(1, min(stored_widget_value, history_entry_count))
+                else:
+                    fallback_step = st.session_state.get("__history_jsonl_step")
+                    if not isinstance(fallback_step, int) or fallback_step < 1:
+                        fallback_step = history_entry_count
+                    previous_step = max(1, min(fallback_step, history_entry_count))
 
                 if st.session_state.get(widget_key) != int(previous_step):
                     st.session_state[widget_key] = int(previous_step)
 
                 history_jsonl_step = st.number_input(
-                    "History JSONL step",
+                    "History replay step",
                     min_value=1,
                     max_value=history_entry_count,
                     value=int(previous_step),
@@ -711,13 +975,13 @@ with tab_runner:
                 st.session_state["__history_jsonl_step"] = int(history_jsonl_step)
             elif history_entry_count == 0:
                 st.session_state.pop(widget_key, None)
-                st.markdown("**History JSONL step**")
+                st.markdown("**History replay step**")
                 st.caption("The selected history directory contains no entries.")
                 history_jsonl_step = None
                 st.session_state["__history_jsonl_step"] = None
             else:
                 st.session_state.pop(widget_key, None)
-                st.markdown("**History JSONL step**")
+                st.markdown("**History replay step**")
                 st.caption("Select a history directory to enable step selection.")
                 history_jsonl_step = None
                 st.session_state["__history_jsonl_step"] = None
@@ -758,9 +1022,33 @@ with tab_runner:
         elasticity = parse_elasticity(elasticity_raw)
 
         if history_jsonl_step is not None:
-            history_step_val = max(0, int(history_jsonl_step) - 1)
+            history_step_index = max(0, int(history_jsonl_step) - 1)
+            history_resume_step = history_step_index + 1
         else:
-            history_step_val = None
+            history_step_index = None
+            history_resume_step = None
+
+        effective_history_jsonl_load = history_jsonl_load
+        if history_jsonl_load and history_step_index is not None:
+            selected_path = Path(history_jsonl_load).expanduser()
+            cache_payload = st.session_state.get("__history_jsonl_cache")
+            try:
+                resolved_selected = str(selected_path.resolve())
+            except OSError:
+                resolved_selected = str(selected_path)
+
+            if cache_payload and cache_payload.get("path") == resolved_selected and selected_path.is_dir():
+                subset_dir = prepare_history_subset(
+                    selected_path,
+                    cache_payload.get("entries", {}),
+                    history_step_index,
+                )
+                if subset_dir is not None:
+                    effective_history_jsonl_load = str(subset_dir)
+                else:
+                    st.warning(
+                        "Unable to prepare history replay data; original directory will be used instead."
+                    )
 
         argument_map = {
             "num_agents": int(num_agents),
@@ -785,9 +1073,9 @@ with tab_runner:
             "elasticity": elasticity,
             "name": name,
             "log_dir": log_dir,
-            "history_jsonl_load": history_jsonl_load,
+            "history_jsonl_load": effective_history_jsonl_load,
             "history_jsonl_save": history_jsonl_save,
-            "history_jsonl_step": history_step_val,
+            "history_jsonl_step": history_resume_step,
             "history_save_interval": int(history_save_interval),
             "platforms": platforms,
             "use_multithreading": use_multithreading,
@@ -800,6 +1088,8 @@ with tab_runner:
             if key == "history_jsonl_step":
                 # Preserve the 1-based UI value so the widget doesn't fall back to its default.
                 stored_args_payload[key] = history_jsonl_step
+            elif key == "history_jsonl_load":
+                stored_args_payload[key] = history_jsonl_load
             else:
                 stored_args_payload[key] = argument_map.get(key)
 
@@ -833,20 +1123,34 @@ with tab_interactions:
         elif not history_dir.is_dir():
             st.error(f"`{history_dir}` 는 디렉터리가 아닙니다.")
         else:
-            jsonl_files = sorted(history_dir.glob("*.jsonl"))
-            if not jsonl_files:
-                st.warning("선택한 디렉터리에서 JSONL 히스토리를 찾지 못했습니다.")
+            available_payloads: Dict[str, Dict[str, Any]] = {}
+            for candidate in sorted(history_dir.iterdir()):
+                if not candidate.is_file():
+                    continue
+                if candidate.suffix.lower() not in {".jsonl", ".json"}:
+                    continue
+                payload = load_history_file(str(candidate))
+                if not payload or not payload.get("entries"):
+                    continue
+                available_payloads[candidate.name] = {
+                    "path": candidate,
+                    "entries": payload.get("entries", []),
+                }
+
+            if not available_payloads:
+                st.warning("선택한 디렉터리에서 재생 가능한 JSON/JSONL 히스토리를 찾지 못했습니다.")
             else:
-                file_names = [candidate.name for candidate in jsonl_files]
+                file_names = sorted(available_payloads.keys())
                 default_planner_idx = 0
-                for idx, candidate in enumerate(jsonl_files):
-                    stem = candidate.stem.lower()
+                for idx, name in enumerate(file_names):
+                    stem = Path(name).stem.lower()
                     if "planner" in stem or stem == "joe":
                         default_planner_idx = idx
                         break
 
                 planner_name = st.selectbox("Planner history file", file_names, index=default_planner_idx)
-                planner_path = history_dir / planner_name
+                planner_info = available_payloads.get(planner_name)
+                planner_path = planner_info["path"] if planner_info else history_dir / planner_name
 
                 worker_candidates = [name for name in file_names if name != planner_name]
                 default_workers = [name for name in worker_candidates if name.startswith("worker_")]
@@ -862,9 +1166,9 @@ with tab_interactions:
                 if not selected_workers:
                     st.info("최소 한 개의 worker 히스토리를 선택하세요.")
                 else:
-                    planner_entries = load_history_entries(str(planner_path))
+                    planner_entries = list(planner_info.get("entries", [])) if planner_info else []
                     worker_entries = {
-                        name: load_history_entries(str(history_dir / name)) for name in selected_workers
+                        name: list(available_payloads[name]["entries"]) for name in selected_workers
                     }
 
                     planner_steps = build_step_index(planner_entries)

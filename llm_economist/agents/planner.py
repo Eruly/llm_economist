@@ -13,7 +13,7 @@ class TaxPlanner(LLMAgent):
         self.num_agents = num_agents
         self.max_timesteps = max_timesteps
         self.bracket_prompt, self.format_prompt = get_bracket_prompt(self.bracket_setting)
-        self.system_prompt = 'You are an expert tax planner. \
+        default_prompt = 'You are an expert tax planner. \
             You set the marginal tax rates in order to optimize social welfare, \
             which is the average of all agent utilities weighted by their inverse pre-tax income. \
             Collected taxes will be redistributed evenly back to the citizens. \
@@ -24,7 +24,11 @@ class TaxPlanner(LLMAgent):
             Explore tax rates that may create suboptimal SWF to find the best ones. \
             Reply with all answers in '\
             'JSON like: {\"DELTA\": '+f'{self.format_prompt}'+'} and replace \"X\" with the percentage that the tax rates will change.'
-        self.init_message_history()
+
+        if not getattr(self, '_message_history_restored', False):
+            self.system_prompt = default_prompt
+        elif not self.system_prompt:
+            self.system_prompt = default_prompt
         self.swf = 0.
         self.llm_swf = 0.   # llm computed social welfare
         self.tax_year = args.two_timescale
@@ -314,7 +318,75 @@ class TaxPlanner(LLMAgent):
             self.logger.info(f"[PLANNER] t={timestep}\ntaxes_rates={self.tax_rates}\nswf={self.swf}")
             # self.logger.info(f"swl_llm={self.llm_swf}\nswf_llm_diff={np.abs(self.llm_swf - self.swf)}")
         return logger
-    
+
+
+    def _serialise_history(self) -> dict:
+        return {"::".join(map(str, key)): values for key, values in self.history.items()}
+
+    def _deserialize_history(self, payload: dict) -> None:
+        self.history = defaultdict(list)
+        for key, values in payload.items():
+            if isinstance(values, list):
+                tuple_key = tuple(int(part) for part in key.split("::") if part)
+                self.history[tuple_key] = values
+
+    def export_resume_state(self) -> dict:
+        state = super().export_resume_state()
+        payload = {
+            "tax_rates": self.tax_rates,
+            "tax_rates_prev": getattr(self, "tax_rates_prev", []),
+            "total_calls": self.total_calls,
+            "swf": self.swf,
+            "llm_swf": self.llm_swf,
+            "leader": self.leader,
+            "best_tax": self.best_tax,
+            "best_swf": self.best_swf,
+            "tax_history": self.tax_history,
+            "swf_history": self.swf_history,
+            "tax_year": self.tax_year,
+            "warmup": self.warmup,
+            "tax_swf": self.tax_swf.tolist() if isinstance(self.tax_swf, np.ndarray) else self.tax_swf,
+            "tax_count": self.tax_count.tolist() if isinstance(self.tax_count, np.ndarray) else self.tax_count,
+            "history": self._serialise_history(),
+        }
+        state.update(self._normalise_for_json(payload))
+        return state
+
+    def load_resume_state(self, payload: dict) -> None:
+        super().load_resume_state(payload)
+        if not payload:
+            return
+
+        for key in [
+            "tax_rates",
+            "tax_rates_prev",
+            "tax_history",
+            "swf_history",
+            "best_tax",
+        ]:
+            if key in payload:
+                setattr(self, key, payload[key])
+
+        for key in [
+            "total_calls",
+            "swf",
+            "llm_swf",
+            "best_swf",
+            "tax_year",
+            "warmup",
+        ]:
+            if key in payload:
+                setattr(self, key, payload[key])
+
+        if "leader" in payload:
+            self.leader = payload["leader"]
+
+        if "tax_swf" in payload:
+            self.tax_swf = np.array(payload["tax_swf"])
+        if "tax_count" in payload:
+            self.tax_count = np.array(payload["tax_count"])
+        if "history" in payload and isinstance(payload["history"], dict):
+            self._deserialize_history(payload["history"])
 
 class FixedTaxPlanner(TaxPlanner):
     def __init__(self, name: str, tax_type: str='US_FED', history_len: int=10, timeout: int=10, args=None, skills: list=None) -> None:

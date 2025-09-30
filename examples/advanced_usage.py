@@ -7,7 +7,30 @@ All simulations run for 20 timesteps for testing purposes.
 
 import os
 import sys
+from pathlib import Path
+
+_THIS_DIR = Path(__file__).resolve().parent
+_ROOT_DIR = _THIS_DIR.parent
+if str(_ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(_ROOT_DIR))
+
 from llm_economist.main import run_simulation
+
+
+def _run_with_connection_guard(args):
+    """Execute the simulation, transforming early SystemExit into RuntimeError."""
+    try:
+        run_simulation(args)
+    except SystemExit as exc:
+        detail = getattr(args, "_llm_connection_error", "")
+        detail_str = str(detail or getattr(exc, "code", exc) or "").strip()
+        message = f"connection failure: {detail_str}" if detail_str else "connection failure"
+        raise RuntimeError(message) from exc
+    except Exception as exc:
+        detail = getattr(args, "_llm_connection_error", "")
+        detail_str = str(detail or exc).strip()
+        message = f"connection failure: {detail_str}" if detail_str else "connection failure"
+        raise RuntimeError(message) from exc
 
 
 def test_rational_openai():
@@ -53,7 +76,7 @@ def test_rational_openai():
         return False
     
     try:
-        run_simulation(args)
+        _run_with_connection_guard(args)
         print("✓ Rational scenario simulation completed successfully")
         return True
     except Exception as e:
@@ -103,7 +126,7 @@ def test_bounded_rationality():
         return False
     
     try:
-        run_simulation(args)
+        _run_with_connection_guard(args)
         print("✓ Bounded rationality simulation completed successfully")
         return True
     except Exception as e:
@@ -153,7 +176,7 @@ def test_democratic_scenario():
         return False
     
     try:
-        run_simulation(args)
+        _run_with_connection_guard(args)
         print("✓ Democratic scenario simulation completed successfully")
         return True
     except Exception as e:
@@ -203,7 +226,7 @@ def test_fixed_workers():
         return False
     
     try:
-        run_simulation(args)
+        _run_with_connection_guard(args)
         print("✓ Fixed workers simulation completed successfully")
         return True
     except Exception as e:
@@ -254,7 +277,7 @@ def test_openrouter_rational():
         return False
     
     try:
-        run_simulation(args)
+        _run_with_connection_guard(args)
         print("✓ OpenRouter rational simulation completed successfully")
         return True
     except Exception as e:
@@ -302,12 +325,12 @@ def test_vllm_rational():
     print("Example: python -m vllm.entrypoints.openai.api_server --model meta-llama/Llama-3.1-8B-Instruct --port 8000")
     
     try:
-        run_simulation(args)
+        _run_with_connection_guard(args)
         print("✓ vLLM rational simulation completed successfully")
         return True
     except Exception as e:
         print(f"✗ vLLM rational simulation failed: {e}")
-        return False
+        raise
 
 
 def test_ollama_rational():
@@ -350,12 +373,12 @@ def test_ollama_rational():
     print("Example: ollama run llama3.1:8b")
     
     try:
-        run_simulation(args)
+        _run_with_connection_guard(args)
         print("✓ Ollama rational simulation completed successfully")
         return True
     except Exception as e:
         print(f"✗ Ollama rational simulation failed: {e}")
-        return False
+        raise
 
 
 def test_gemini_rational():
@@ -401,7 +424,7 @@ def test_gemini_rational():
         return False
     
     try:
-        run_simulation(args)
+        _run_with_connection_guard(args)
         print("✓ Gemini rational simulation completed successfully")
         return True
     except Exception as e:

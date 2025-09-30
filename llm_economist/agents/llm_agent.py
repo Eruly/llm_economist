@@ -1,7 +1,7 @@
 import logging
 from pathlib import Path
 from time import sleep
-from typing import Optional
+from typing import Dict, Optional
 from ..utils.common import Message
 import json
 from ..models.openai_model import OpenAIModel
@@ -41,10 +41,15 @@ class LLMAgent:
         self.prompt_algo = prompt_algo
         self.K = K  # depth of prompt trees
 
+        self._message_history_restored = False
+        self._llm_history_restored = False
         self.history_save_path: Optional[str] = None
         self.history_save_interval: int = 0
         self.history_load_path: Optional[str] = None
         self.history_load_step: Optional[int] = None
+        self.history_resume_step: Optional[int] = None
+        self.message_history_save_path: Optional[str] = None
+        self.message_history_load_path: Optional[str] = None
         self._configure_history_persistence(args)
 
     def _create_llm_model(self, llm_type: str, port: int, args):
@@ -81,10 +86,35 @@ class LLMAgent:
             if for_save:
                 path = candidate
             else:
-                if candidate.exists():
-                    path = candidate
-                elif path.exists():
-                    path = path
+                search_order = []
+                seen = set()
+
+                def _add_option(option):
+                    if option is None:
+                        return
+                    key = option.resolve() if option.is_absolute() else option
+                    if key in seen:
+                        return
+                    seen.add(key)
+                    search_order.append(option)
+
+                _add_option(candidate)
+                _add_option(path.parent / f"{self.name}{path.suffix}")
+                _add_option(path if path.exists() else None)
+                try:
+                    siblings = sorted(path.parent.glob(f"*{self.name}*.jsonl"))
+                except (OSError, RuntimeError):
+                    siblings = []
+                for sibling in siblings:
+                    _add_option(sibling)
+
+                for option in search_order:
+                    try:
+                        if option.exists():
+                            path = option
+                            break
+                    except OSError:
+                        continue
                 else:
                     path = candidate
 
@@ -92,47 +122,246 @@ class LLMAgent:
             path.parent.mkdir(parents=True, exist_ok=True)
         else:
             if not path.exists() and path.parent.exists():
-                candidates = sorted(path.parent.glob(f"*{self.name}*.jsonl"))
+                try:
+                    candidates = sorted(path.parent.glob(f"*{self.name}*.jsonl"))
+                except (OSError, RuntimeError):
+                    candidates = []
                 if candidates:
                     path = candidates[0]
 
         return str(path)
+
+    def _derive_message_history_path(self, base_path: Optional[str]) -> Optional[str]:
+        if not base_path:
+            return None
+
+        path = Path(base_path)
+        stem = path.stem
+        target = path.with_name(f"{stem}_messages.json")
+        return str(target)
+
+    def _normalise_for_json(self, value):
+        if isinstance(value, np.generic):  # type: ignore[attr-defined]
+            return value.item()
+        if isinstance(value, list):
+            return [self._normalise_for_json(item) for item in value]
+        if isinstance(value, dict):
+            return {key: self._normalise_for_json(val) for key, val in value.items()}
+        return value
+
+    def _load_message_history(self, upto_step: Optional[int]) -> dict:
+        result: dict = {"messages_loaded": False, "llm_history": []}
+        if not self.message_history_load_path:
+            return result
+
+        path = Path(self.message_history_load_path)
+        if not path.exists():
+            return result
+
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            self.logger.warning(f"[{self.name}] Failed to load message history from {path}")
+            return result
+
+        if isinstance(payload, dict):
+            entries = payload.get("messages", [])
+            llm_history = payload.get("llm_history", [])
+        else:
+            entries = payload
+            llm_history = []
+
+        if not isinstance(entries, list):
+            return result
+
+        indexed: Dict[int, dict] = {}
+        for idx, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                continue
+            try:
+                step = int(entry.get("timestep", idx))
+            except (TypeError, ValueError):
+                continue
+            normalised = dict(entry)
+            normalised["timestep"] = step
+            indexed[step] = normalised
+
+        if not indexed:
+            return result
+
+        max_recorded_step = max(indexed)
+        target_max = max_recorded_step if upto_step is None else max(upto_step, 0)
+
+        restored = [
+            dict(indexed.get(step, self._make_empty_message_entry(step)))
+            for step in range(target_max + 1)
+        ]
+
+        self.message_history = restored
+        self._message_index = {entry["timestep"]: entry for entry in restored}
+
+        target_step = upto_step if upto_step is not None else target_max
+        candidate = self._message_index.get(target_step)
+        if candidate:
+            candidate_prompt = candidate.get("system_prompt")
+            if candidate_prompt:
+                self.system_prompt = candidate_prompt
+
+        result["messages_loaded"] = True
+        result["llm_history"] = llm_history if isinstance(llm_history, list) else []
+        result["max_step"] = max_recorded_step
+        self._message_history_restored = True
+        return result
+
+    def _save_message_history(self) -> None:
+        if not self.message_history_save_path:
+            return
+
+        path = Path(self.message_history_save_path)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            normalised = [self._normalise_for_json(entry) for entry in self.message_history]
+            llm_history = [
+                self._normalise_for_json(record)
+                for record in getattr(self.llm, "history", [])
+            ]
+            payload = {
+                "messages": normalised,
+                "llm_history": llm_history,
+            }
+            with path.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            self.logger.error(f"[{self.name}] Unable to save message history to {path}: {exc}")
+
+    def export_resume_state(self) -> dict:
+        return {
+            "system_prompt": self.system_prompt,
+            "history_len": self.history_len,
+        }
+
+    def load_resume_state(self, payload: Optional[dict]) -> None:
+        if not payload:
+            return
+
+        system_prompt = payload.get("system_prompt")
+        if system_prompt:
+            self.system_prompt = system_prompt
 
     def _configure_history_persistence(self, args) -> None:
         if self.llm is None or self.name == 'TestAgent':
             return
 
         self.history_save_interval = max(0, getattr(args, 'history_save_interval', 0) or 0)
-        self.history_load_step = getattr(args, 'history_jsonl_step', None)
+
+        # Reset restoration flags before attempting any load operations.
+        self._message_history_restored = False
+        self._llm_history_restored = False
+
+        resume_step_raw = getattr(args, 'history_jsonl_step', None)
+        if resume_step_raw is not None:
+            try:
+                self.history_resume_step = max(0, int(resume_step_raw))
+            except (TypeError, ValueError):
+                self.history_resume_step = None
+        else:
+            self.history_resume_step = None
+
+        self.history_load_step = (
+            self.history_resume_step - 1
+            if (self.history_resume_step is not None and self.history_resume_step > 0)
+            else None
+        )
 
         self.history_load_path = self._resolve_history_path(getattr(args, 'history_jsonl_load', None), for_save=False)
         self.history_save_path = self._resolve_history_path(getattr(args, 'history_jsonl_save', None), for_save=True)
+        self.message_history_load_path = self._derive_message_history_path(self.history_load_path)
+        target_save_base = self.history_save_path or self.history_load_path
+        self.message_history_save_path = self._derive_message_history_path(target_save_base)
 
         if self.history_save_path:
             self.logger.info(f"[{self.name}] History persistence enabled: {self.history_save_path}")
 
-        if self.history_load_path:
+        llm_history_loaded = False
+        if self.message_history_load_path:
+            message_result = self._load_message_history(self.history_resume_step)
+            max_recorded_step = (
+                message_result.get("max_step")
+                if isinstance(message_result, dict)
+                else None
+            )
+            self._message_history_restored = bool(
+                isinstance(message_result, dict) and message_result.get("messages_loaded")
+            )
+
+            if isinstance(max_recorded_step, int):
+                if self.history_load_step is not None and self.history_load_step > max_recorded_step:
+                    self.logger.warning(
+                        f"[{self.name}] Requested replay step {self.history_load_step} exceeds available history {max_recorded_step}; truncating."
+                    )
+                    self.history_load_step = max_recorded_step
+
+                if (
+                    self.history_resume_step is not None
+                    and self.history_resume_step > max_recorded_step + 1
+                ):
+                    self.logger.warning(
+                        f"[{self.name}] Requested resume step {self.history_resume_step} exceeds available history; resuming from step {max_recorded_step + 1} instead."
+                    )
+                    self.history_resume_step = max_recorded_step + 1
+                    message_result = self._load_message_history(self.history_resume_step)
+                    max_recorded_step = (
+                        message_result.get("max_step")
+                        if isinstance(message_result, dict)
+                        else max_recorded_step
+                    )
+
+            llm_payload = (
+                message_result.get("llm_history")
+                if isinstance(message_result, dict)
+                else None
+            )
+            if llm_payload:
+                try:
+                    self.llm.load_history_records(llm_payload, upto_step=self.history_load_step)
+                    llm_history_loaded = True
+                except (IndexError, AttributeError) as exc:
+                    self.logger.warning(
+                        f"[{self.name}] Unable to restore LLM history from messages file: {exc}"
+                    )
+
+        if not llm_history_loaded and self.history_load_path:
             try:
                 self.llm.load_history_jsonl(self.history_load_path, upto_step=self.history_load_step)
-                if getattr(self.llm, "history", None):
-                    try:
-                        self.llm.enable_history_replay(upto_step=self.history_load_step)
-                    except (ValueError, IndexError) as exc:
-                        self.logger.warning(
-                            f"[{self.name}] Unable to enable history replay: {exc}"
-                        )
-                suffix = '' if self.history_load_step is None else f" up to step {self.history_load_step}"
-                self.logger.info(f"[{self.name}] Loaded history from {self.history_load_path}{suffix}")
-            except (FileNotFoundError, IndexError) as exc:
-                msg = f"[{self.name}] Failed to load history from {self.history_load_path}: {exc}"
-                self.logger.error(msg)
-                raise
+                llm_history_loaded = bool(getattr(self.llm, "history", None))
+            except FileNotFoundError:
+                llm_history_loaded = False
             except Exception as exc:
                 self.logger.error(f"[{self.name}] Unexpected error loading history: {exc}")
                 raise
 
+        self._llm_history_restored = llm_history_loaded
+
+        if llm_history_loaded and getattr(self.llm, "history", None):
+            try:
+                self.llm.enable_history_replay(upto_step=self.history_load_step)
+            except (ValueError, IndexError) as exc:
+                self.logger.warning(
+                    f"[{self.name}] Unable to enable history replay: {exc}"
+                )
+
+        if self.history_load_path and llm_history_loaded:
+            details = []
+            if self.history_load_step is not None:
+                details.append(f"up to step {self.history_load_step}")
+            if self.history_resume_step is not None:
+                details.append(f"resuming from step {self.history_resume_step}")
+            suffix = f" {'; '.join(details)}" if details else ''
+            self.logger.info(f"[{self.name}] Loaded history from {self.history_load_path}{suffix}")
+
     def maybe_save_history(self, timestep: int, *, force: bool = False) -> None:
-        if self.llm is None or self.history_save_path is None:
+        if self.llm is None:
             return
 
         should_save = force
@@ -142,42 +371,44 @@ class LLMAgent:
         if not should_save:
             return
 
+        target_path = self.message_history_save_path or self.history_save_path or "<memory>"
+
         try:
-            self.llm.save_history_jsonl(self.history_save_path)
+            self._save_message_history()
             if force or self.history_save_interval:
-                self.logger.info(f"[{self.name}] Saved history to {self.history_save_path}")
+                self.logger.info(f"[{self.name}] Saved history to {target_path}")
         except Exception as exc:
-            self.logger.error(f"[{self.name}] Failed to save history to {self.history_save_path}: {exc}")
+            self.logger.error(f"[{self.name}] Failed to save history to {target_path}: {exc}")
 
     def act(self) -> str:
         raise NotImplementedError
     
-    def init_message_history(self) -> None:
-        # [{timestep: i, 'system_prompt': '', 'user_prompt': 'Historical timesteps: ', 'action': '' }, ...]
-        # init first timestep
-        self.message_history = [{
-            'timestep': 0,
-            'system_prompt': '',
+    def _make_empty_message_entry(self, timestep: int) -> dict:
+        return {
+            'timestep': timestep,
+            'system_prompt': '' if timestep == 0 else (self.system_prompt or ''),
             'user_prompt': '',
             'historical': '',
             'action': '',
-            'leader': 'planner',
+            'leader': 'planner' if timestep == 0 else '',
             'metric': 0
-        }]
+        }
+
+    def init_message_history(self) -> None:
+        # [{timestep: i, 'system_prompt': '', 'user_prompt': 'Historical timesteps: ', 'action': '' }, ...]
+        # init first timestep
+        self.message_history = [self._make_empty_message_entry(0)]
+        self._message_index: Dict[int, dict] = {0: self.message_history[0]}
         return
 
     def add_message_history_timestep(self, timestep: int) -> None:
         assert self.system_prompt is not None
-        new_msg_dict = {
-            'timestep': timestep,
-            'system_prompt': self.system_prompt,
-            'user_prompt': '',
-            'historical': '',
-            'action': '',
-            'leader': '',
-            'metric': 0
-        }
-        self.message_history.append(new_msg_dict)
+        new_entry = self._make_empty_message_entry(timestep)
+        new_entry['system_prompt'] = self.system_prompt
+        self.message_history.append(new_entry)
+        if not hasattr(self, '_message_index'):
+            self._message_index = {}
+        self._message_index[timestep] = new_entry
         return
     
     def get_historical_message(self, timestep: int, retry: bool=False, include_user_prompt: bool=True) -> str:

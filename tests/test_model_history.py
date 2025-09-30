@@ -60,6 +60,7 @@ def test_history_save_and_load(tmp_path):
 
     assert len(loaded) == 1
     assert reloaded_model.history[0]["response"] == "resp:user"
+    assert reloaded_model.history[0]["step"] == 0
 
 
 def test_restore_history_step(tmp_path):
@@ -85,6 +86,20 @@ def test_restore_history_step(tmp_path):
     truncated_model.load_history_jsonl(str(out_file), upto_step=1)
     assert len(truncated_model.history) == 2
     assert truncated_model.history[-1]["user_prompt"] == "user1"
+
+
+def test_get_history_entry_by_step(tmp_path):
+    model = DummyModel()
+    for idx in range(5):
+        model.send_msg("sys", f"user{idx}")
+
+    out_file = tmp_path / "history.jsonl"
+    model.save_history_jsonl(str(out_file))
+
+    reloaded = DummyModel()
+    reloaded.load_history_jsonl(str(out_file))
+    entry = reloaded.get_history_entry_by_step(3)
+    assert entry["user_prompt"] == "user3"
 
 
 def test_json_history_record(tmp_path):

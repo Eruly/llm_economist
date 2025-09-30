@@ -4,7 +4,13 @@ OpenAI model implementation for the LLM Economist framework.
 
 from typing import Tuple, Optional
 import os
-from openai import OpenAI, RateLimitError
+try:
+    from openai import OpenAI, RateLimitError
+except ImportError:  # pragma: no cover - optional dependency
+    OpenAI = None
+
+    class RateLimitError(Exception):
+        pass
 from time import sleep
 from .base import BaseLLMModel
 
@@ -28,7 +34,10 @@ class OpenAIModel(BaseLLMModel):
         # Get API key from parameter or environment
         if api_key is None:
             api_key = os.getenv('OPENAI_API_KEY') or os.getenv('ECON_OPENAI')
-        
+
+        if OpenAI is None:
+            raise ImportError("openai package is required to use OpenAIModel")
+
         if not api_key:
             raise ValueError("OpenAI API key not found. Set OPENAI_API_KEY environment variable or pass api_key parameter.")
         

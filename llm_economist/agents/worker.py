@@ -343,8 +343,9 @@ class Worker(LLMAgent):
             utility_name = 'negative social welfare'
         else:
             raise ValueError('Invalid utility type')
+
         if self.role == 'default':
-            self.system_prompt = 'You are ' + self.name + ', a citizen of Princetonia. Your skill level is ' + str(self.v) + f' with an expected income of {self.v*40} at 40 hours of labor each week.'\
+            default_prompt = 'You are ' + self.name + ', a citizen of Princetonia. Your skill level is ' + str(self.v) + f' with an expected income of {self.v*40} at 40 hours of labor each week.'\
                     ' Each year you will have the option to choose the number of hours of labor to perform each week. \
                     You can work overtime (>40 hours per week) or undertime (<40 hours per week). \
                     You will receive income z proportional to the number of hours worked and your skill level. \
@@ -355,7 +356,7 @@ class Worker(LLMAgent):
                     # Use the JSON format: {\"LABOR\": \"X\",\"z\": \"X\", \"u\": \"X\"} and replace \"X\" with your answer.\n'
         else:
             assert self.utility_type == 'egotistical', 'Only egotistical utility is supported for personas'
-            self.system_prompt = 'You are ' + self.name + ', a citizen of Princetonia. Your skill level is ' + str(self.v) + f' with an expected income of {self.v*40} at 40 hours of labor each week.'\
+            default_prompt = 'You are ' + self.name + ', a citizen of Princetonia. Your skill level is ' + str(self.v) + f' with an expected income of {self.v*40} at 40 hours of labor each week.'\
                     ' Each year you will have the option to choose the number of hours of labor to perform each week. \
                     You can work overtime (>40 hours per week) or undertime (<40 hours per week). \
                     You will receive income z proportional to the number of hours worked and your skill level. \
@@ -364,8 +365,13 @@ class Worker(LLMAgent):
                     Once you find the maximum utility, only output LABOR corresponding to maximum utility u. \
                     Use the JSON format: {\"LABOR\": \"X\"} and replace \"X\" with your answer.\n'
                     # Use the JSON format: {\"LABOR\": \"X\",\"z\": \"X\", \"u\": \"X\"} and replace \"X\" with your answer.\n'
+
+        if not getattr(self, '_message_history_restored', False):
+            self.system_prompt = default_prompt
+        elif not self.system_prompt:
+            self.system_prompt = default_prompt
+
         self.logger.info("[WORKER INIT] My name is " + name + " My skill level is " + str(self.v) + " My role is " + self.role + " My utility type is " + self.utility_type)
-        self.init_message_history()
 
         # self.best_labor = 0
         self.best_utility = 0
@@ -381,6 +387,75 @@ class Worker(LLMAgent):
     @property
     def labor(self):
         return self.l
+
+    def export_resume_state(self) -> dict:
+        state = super().export_resume_state()
+        payload = {
+            "z": self.z,
+            "l": self.l,
+            "utility": self.utility,
+            "adjusted_utility": self.adjusted_utility,
+            "leader": self.leader,
+            "platform": self.platform,
+            "swf": getattr(self, "swf", 0),
+            "vote": self.vote,
+            "tax_paid": self.tax_paid,
+            "rebate": getattr(self, "rebate", 0),
+            "r": self.r,
+            "z_tilde": getattr(self, "z_tilde", 0),
+            "tax_rates": self.tax_rates,
+            "utility_history": self.utility_history,
+            "labor_history": self.labor_history,
+            "labor_avg_util": self.labor_avg_util,
+            "labor_count": self.labor_count,
+            "labor_prev": self.labor_prev,
+            "utility_prev": self.utility_prev,
+            "best_utility": self.best_utility,
+            "best_utility_ind": self.best_utility_ind,
+            "v": self.v,
+        }
+        state.update(self._normalise_for_json(payload))
+        return state
+
+    def load_resume_state(self, payload: dict) -> None:
+        super().load_resume_state(payload)
+        if not payload:
+            return
+
+        for key in [
+            "z",
+            "l",
+            "utility",
+            "adjusted_utility",
+            "tax_paid",
+            "rebate",
+            "r",
+            "z_tilde",
+            "best_utility",
+            "best_utility_ind",
+            "labor_prev",
+            "utility_prev",
+            "vote",
+            "v",
+            "swf",
+        ]:
+            if key in payload:
+                setattr(self, key, payload[key])
+
+        for key in [
+            "tax_rates",
+            "utility_history",
+            "labor_history",
+            "labor_avg_util",
+            "labor_count",
+        ]:
+            if key in payload and isinstance(payload[key], list):
+                setattr(self, key, payload[key])
+
+        if "leader" in payload:
+            self.leader = payload["leader"]
+        if "platform" in payload:
+            self.platform = payload["platform"]
 
     def compute_isoelastic_utility(self, post_tax_income: float, tax_rebate: float) -> float:
         z_tilde = post_tax_income + tax_rebate    # post-tax income

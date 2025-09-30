@@ -6,7 +6,13 @@ from typing import Tuple, Optional
 import os
 import requests
 import json
-from openai import OpenAI, RateLimitError
+try:
+    from openai import OpenAI, RateLimitError
+except ImportError:  # pragma: no cover - optional dependency
+    OpenAI = None
+
+    class RateLimitError(Exception):
+        pass
 from time import sleep
 from .base import BaseLLMModel
 
@@ -29,10 +35,13 @@ class VLLMModel(BaseLLMModel):
             temperature: Temperature for sampling
         """
         super().__init__(model_name, max_tokens, temperature)
-        
+
         self.base_url = base_url
         self.api_key = api_key
-        
+
+        if OpenAI is None:
+            raise ImportError("openai package is required to use VLLMModel")
+
         # Initialize OpenAI client for vLLM compatibility
         self.client = OpenAI(
             api_key=api_key,

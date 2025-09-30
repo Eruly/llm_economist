@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 import json
 import logging
 import time
@@ -27,6 +27,7 @@ class BaseLLMModel(ABC):
         self.logger = logging.getLogger(__name__)
         self.stop_tokens = ['}']
         self.history: List[Dict[str, Any]] = []
+        self._history_index: Dict[int, Dict[str, Any]] = {}
         self._replay_enabled: bool = False
         self._replay_cursor: int = 0
         self._replay_limit: int = -1
@@ -96,6 +97,12 @@ class BaseLLMModel(ABC):
     ) -> Dict[str, Any]:
         """Store an interaction in the in-memory history."""
 
+        next_step = (
+            max(self._history_index.keys()) + 1
+            if getattr(self, "_history_index", None)
+            else len(self.history)
+        )
+
         entry: Dict[str, Any] = {
             "system_prompt": system_prompt,
             "user_prompt": user_prompt,
@@ -107,7 +114,9 @@ class BaseLLMModel(ABC):
         }
         if metadata:
             entry["metadata"] = metadata
+        entry.setdefault("step", next_step)
         self.history.append(entry)
+        self._history_index[int(entry["step"])] = entry
         return entry
 
     def save_history_jsonl(self, filepath: str) -> None:
@@ -118,8 +127,64 @@ class BaseLLMModel(ABC):
 
         with path.open("w", encoding="utf-8") as fh:
             for step, entry in enumerate(self.history):
-                record = {"step": step, **entry}
+                record = {"step": entry.get("step", step), **entry}
                 fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def load_history_records(
+        self,
+        records: Iterable[Dict[str, Any]],
+        *,
+        upto_step: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Replace the in-memory history with ``records``.
+
+        Args:
+            records: An iterable with entries previously produced by
+                :meth:`_record_history` or :meth:`save_history_jsonl`.
+            upto_step: If provided, retain only entries whose ``step`` value is
+                less than or equal to ``upto_step``.
+
+        Returns:
+            The normalised history list stored on the model.
+        """
+
+        self.disable_history_replay()
+
+        normalised: List[Dict[str, Any]] = []
+        index: Dict[int, Dict[str, Any]] = {}
+
+        for idx, raw_entry in enumerate(records):
+            entry = dict(raw_entry)
+            try:
+                step = int(entry.get("step", idx))
+            except (TypeError, ValueError):
+                step = idx
+            entry["step"] = step
+            index[step] = entry
+            normalised.append(entry)
+
+        normalised.sort(key=lambda item: item["step"])
+
+        if upto_step is not None:
+            if index:
+                max_step = max(index)
+                if upto_step > max_step:
+                    self.logger.debug(
+                        "Capping requested history step %s to latest available step %s",
+                        upto_step,
+                        max_step,
+                    )
+                    upto_step = max_step
+            if upto_step not in index:
+                raise IndexError(
+                    f"Requested step {upto_step} is out of range for history entries {sorted(index)}"
+                )
+            normalised = [item for item in normalised if item["step"] <= upto_step]
+            index = {step: entry for step, entry in index.items() if step <= upto_step}
+
+        self.history = normalised
+        self._history_index = index
+        return self.history
 
     def load_history_jsonl(self, filepath: str, upto_step: Optional[int] = None) -> List[Dict[str, Any]]:
         """Load history from a JSON Lines file and optionally truncate to a step."""
@@ -128,8 +193,6 @@ class BaseLLMModel(ABC):
         if not path.exists():
             raise FileNotFoundError(f"History file not found: {filepath}")
 
-        self.disable_history_replay()
-
         loaded: List[Dict[str, Any]] = []
         with path.open("r", encoding="utf-8") as fh:
             for line in fh:
@@ -137,29 +200,35 @@ class BaseLLMModel(ABC):
                 if not line:
                     continue
                 data = json.loads(line)
-                data.pop("step", None)
                 loaded.append(data)
 
-        self.history = loaded
-
-        if upto_step is not None:
-            if upto_step < 0 or upto_step >= len(self.history):
-                raise IndexError(f"Requested step {upto_step} is out of range for history length {len(self.history)}")
-            self.history = self.history[: upto_step + 1]
-        return self.history
+        return self.load_history_records(loaded, upto_step=upto_step)
 
     def get_history_step(self, step: int) -> Dict[str, Any]:
         """Return the recorded interaction at the requested step."""
 
-        if step < 0 or step >= len(self.history):
-            raise IndexError(f"Requested step {step} is out of range for history length {len(self.history)}")
-        return self.history[step]
+        return self.get_history_entry_by_step(step)
+
+    def get_history_entry_by_step(self, step: int) -> Dict[str, Any]:
+        """Return history entry that matches ``step`` even if steps are non-contiguous."""
+
+        if not hasattr(self, "_history_index"):
+            self._history_index = {
+                int(entry.get("step", idx)): entry
+                for idx, entry in enumerate(self.history)
+            }
+        try:
+            return self._history_index[int(step)]
+        except (KeyError, ValueError):
+            raise IndexError(f"No history entry recorded for step {step}")
 
     def restore_history_to_step(self, step: int) -> Dict[str, Any]:
         """Trim history to the specified step and return the retained entry."""
-
-        entry = self.get_history_step(step)
-        self.history = self.history[: step + 1]
+        entry = self.get_history_entry_by_step(step)
+        self.history = [item for item in self.history if int(item.get("step", 0)) <= step]
+        self._history_index = {
+            int(item.get("step", idx)): item for idx, item in enumerate(self.history)
+        }
         return entry
 
     # -- History replay helpers -------------------------------------------------
@@ -183,16 +252,18 @@ class BaseLLMModel(ABC):
             raise ValueError("Cannot enable history replay without any loaded history.")
 
         if upto_step is None:
-            limit = len(self.history) - 1
+            limit_index = len(self.history) - 1
         else:
-            if upto_step < 0 or upto_step >= len(self.history):
+            target_entry = self.get_history_entry_by_step(upto_step)
+            try:
+                limit_index = self.history.index(target_entry)
+            except ValueError:
                 raise IndexError(
-                    f"Requested replay step {upto_step} is out of range for history length {len(self.history)}"
+                    f"Requested replay step {upto_step} is unavailable in history"
                 )
-            limit = upto_step
 
         self._replay_cursor = 0
-        self._replay_limit = limit
+        self._replay_limit = limit_index
         self._replay_enabled = True
 
     def has_pending_replay(self) -> bool:

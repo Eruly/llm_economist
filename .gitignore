@@ -193,4 +193,6 @@ cython_debug/
 
 .env
 
-history/
+history*/*
+# history로 시작하는 모든 폴더 (예: history, history_123 등)
+.streamlit_history_cache/

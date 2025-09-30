@@ -8,7 +8,23 @@ import os
 import sys
 import concurrent.futures
 import torch.multiprocessing as mp
-import trackio as wandb
+try:
+    import trackio as wandb
+except ImportError:  # pragma: no cover - fallback for test environments
+    class _WandbStub:
+        @staticmethod
+        def init(*_args, **_kwargs):
+            return None
+
+        @staticmethod
+        def log(*_args, **_kwargs):
+            return None
+
+        @staticmethod
+        def finish(*_args, **_kwargs):
+            return None
+
+    wandb = _WandbStub()
 import random
 import numpy as np
 import time
@@ -16,19 +32,48 @@ from .utils.common import distribute_agents, count_votes, rGB2, GEN_ROLE_MESSAGE
 from .agents.worker import Worker, FixedWorker, distribute_personas
 from .agents.llm_agent import LLMAgent, TestAgent
 from .agents.planner import TaxPlanner, FixedTaxPlanner
-from dotenv import load_dotenv
+
+try:  # Allow running without optional dependency in test environments
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - best-effort fallback
+    def load_dotenv(*_args, **_kwargs):
+        return False
+from .utils.history_io import (
+    load_simulation_metadata,
+    merge_args_from_metadata,
+    save_simulation_metadata,
+)
 
 load_dotenv()
 
 def setup_logging(args):
-    """Setup logging configuration."""
-    if not os.path.exists(args.log_dir):
-        os.makedirs(args.log_dir)
-    
-    log_filename = f'{args.log_dir}/{args.name if args.name else "simulation"}.log'
+    """Setup logging configuration.
+
+    ``args`` may be an argparse namespace or a plain log level; this makes the
+    helper test-friendly.
+    """
+
+    default_dir = 'logs'
+    default_name = 'simulation'
+    default_level = logging.INFO
+
+    if isinstance(args, int):
+        log_level = args
+        log_dir = default_dir
+        log_name = default_name
+    else:
+        log_dir = getattr(args, 'log_dir', default_dir) or default_dir
+        log_name = getattr(args, 'name', default_name) or default_name
+        log_level = getattr(args, 'log_level', default_level)
+        if isinstance(log_level, str):
+            log_level = getattr(logging, log_level.upper(), default_level)
+
+    os.makedirs(log_dir, exist_ok=True)
+
+    log_filename = f'{log_dir}/{log_name}.log'
     logging.basicConfig(
         filename=log_filename,
-        level=logging.INFO,
+        level=log_level,
         format='%(asctime)s - %(levelname)s - %(message)s'
     )
 
@@ -36,48 +81,128 @@ def setup_logging(args):
 def run_simulation(args):
     """Run the main simulation."""
     logger = logging.getLogger('main')
-    
+
+    def ensure_attr(obj, name, default):
+        value = getattr(obj, name, default)
+        if value is None:
+            value = default
+        setattr(obj, name, value)
+        return value
+
+    loaded_metadata = load_simulation_metadata(getattr(args, 'history_jsonl_load', None))
+    if loaded_metadata:
+        if getattr(args, 'history_jsonl_step', None) is None and isinstance(loaded_metadata.get("latest_step"), int):
+            args.history_jsonl_step = int(loaded_metadata["latest_step"]) + 1
+        merge_args_from_metadata(
+            args,
+            loaded_metadata,
+            override_keys=[
+                key for key in loaded_metadata.get("args", {}).keys()
+                if key not in {"history_jsonl_step", "history_jsonl_load", "history_jsonl_save"}
+            ],
+        )
+
+    # Normalise commonly accessed attributes with sensible defaults so tests can
+    # pass lightweight namespaces.
+    worker_type = ensure_attr(args, 'worker_type', 'LLM')
+    planner_type = ensure_attr(args, 'planner_type', 'LLM')
+    llm_model = ensure_attr(args, 'llm', 'gpt-4o-mini')
+    port = ensure_attr(args, 'port', 8000)
+    ensure_attr(args, 'service', 'vllm')
+    ensure_attr(args, 'prompt_algo', 'io')
+    ensure_attr(args, 'history_len', 20)
+    ensure_attr(args, 'timeout', 10)
+    ensure_attr(args, 'agent_mix', 'us_income')
+    ensure_attr(args, 'percent_ego', 100)
+    ensure_attr(args, 'percent_alt', 0)
+    ensure_attr(args, 'percent_adv', 0)
+    ensure_attr(args, 'warmup', 0)
+    ensure_attr(args, 'platforms', False)
+    ensure_attr(args, 'use_multithreading', False)
+    ensure_attr(args, 'wandb', False)
+    ensure_attr(args, 'debug', False)
+    ensure_attr(args, 'num_agents', max(1, getattr(args, 'num_agents', 1)))
+    ensure_attr(args, 'max_timesteps', max(1, getattr(args, 'max_timesteps', 1)))
+    ensure_attr(args, 'scenario', getattr(args, 'scenario', 'rational'))
+    ensure_attr(args, 'bracket_setting', getattr(args, 'bracket_setting', 'two'))
+    ensure_attr(args, 'name', getattr(args, 'name', 'simulation'))
+
+    two_timescale = ensure_attr(args, 'two_timescale', 1)
+    if not isinstance(two_timescale, int) or two_timescale <= 0:
+        two_timescale = 1
+    args.two_timescale = two_timescale
+
     # Test LLM connectivity
-    if args.worker_type == 'LLM' or args.planner_type == 'LLM':
+    if worker_type == 'LLM' or planner_type == 'LLM':
         try:
-            TestAgent(args.llm, args.port, args)
-            logger.info(f"Successfully connected to LLM: {args.llm}")
+            TestAgent(llm_model, port, args)
+            logger.info(f"Successfully connected to LLM: {llm_model}")
         except Exception as e:
             logger.error(f"Failed to connect to LLM: {e}")
-            if args.worker_type == 'LLM' or args.planner_type == 'LLM':
+            if worker_type == 'LLM' or planner_type == 'LLM':
+                setattr(args, '_llm_connection_error', str(e))
                 sys.exit(1)
     
     # Initialize skill distribution
-    if args.agent_mix == 'uniform':
-        skills = [-1] * args.num_agents  # maps to uniform distribution in worker.py
-    elif args.agent_mix == 'us_income':
-        # U.S. incomes to skill level (income level is at 40 hours per week)
-        skills = [float(x / 40) for x in rGB2(args.num_agents)] 
-        print(skills)
-        logger.info(f"Skills sampled from GB2 Distribution: {skills}")
+    metadata_skills = None
+    metadata_personas = None
+    metadata_utility_types = None
+    if loaded_metadata:
+        metadata_skills = loaded_metadata.get("skills")
+        metadata_personas = loaded_metadata.get("personas")
+        metadata_utility_types = loaded_metadata.get("utility_types")
+
+    if metadata_skills is not None and len(metadata_skills) != args.num_agents:
+        logger.warning(
+            "Loaded skills length %s does not match num_agents %s; regenerating instead.",
+            len(metadata_skills),
+            args.num_agents,
+        )
+        metadata_skills = None
+
+    if metadata_skills is not None:
+        skills = metadata_skills
     else:
-        raise ValueError(f'Unknown agent mix: {args.agent_mix}')
-    
+        if args.agent_mix == 'uniform':
+            skills = [-1] * args.num_agents  # maps to uniform distribution in worker.py
+        elif args.agent_mix == 'us_income':
+            # U.S. incomes to skill level (income level is at 40 hours per week)
+            skills = [float(x / 40) for x in rGB2(args.num_agents)]
+            print(skills)
+            logger.info(f"Skills sampled from GB2 Distribution: {skills}")
+        else:
+            raise ValueError(f'Unknown agent mix: {args.agent_mix}')
+
     # Initialize agents
     agents = []
     personas = []
-    
-    if args.scenario == 'rational':
-        personas = ['default' for i in range(args.num_agents)]
-        utility_types = ['egotistical' for i in range(args.num_agents)]
-    elif args.scenario in ('bounded', 'democratic'):
-        # Generate personas
-        persona_data = distribute_personas(args.num_agents, args.llm, args.port, args.service)
-        global GEN_ROLE_MESSAGES
-        GEN_ROLE_MESSAGES.clear()
-        GEN_ROLE_MESSAGES.update(persona_data)
-        personas = list(GEN_ROLE_MESSAGES.keys())
-        
-        assert (args.percent_ego + args.percent_alt + args.percent_adv) == 100
-        utility_types = distribute_agents(args.num_agents, [args.percent_ego, args.percent_alt, args.percent_adv])
-        print('utility_types', utility_types)
-        logger.info(f"Utility Types: {utility_types}")
-    
+
+    if (
+        metadata_personas is not None and metadata_utility_types is not None
+        and len(metadata_personas) == args.num_agents
+        and len(metadata_utility_types) == args.num_agents
+    ):
+        personas = metadata_personas
+        utility_types = metadata_utility_types
+    else:
+        if args.scenario == 'rational':
+            personas = ['default' for i in range(args.num_agents)]
+            utility_types = ['egotistical' for i in range(args.num_agents)]
+        elif args.scenario in ('bounded', 'democratic'):
+            # Generate personas
+            persona_data = distribute_personas(args.num_agents, args.llm, args.port, args.service)
+            global GEN_ROLE_MESSAGES
+            GEN_ROLE_MESSAGES.clear()
+            GEN_ROLE_MESSAGES.update(persona_data)
+            personas = list(GEN_ROLE_MESSAGES.keys())
+
+            assert (args.percent_ego + args.percent_alt + args.percent_adv) == 100
+            utility_types = distribute_agents(args.num_agents, [args.percent_ego, args.percent_alt, args.percent_adv])
+            print('utility_types', utility_types)
+            logger.info(f"Utility Types: {utility_types}")
+        else:
+            raise ValueError(f'Unknown scenario: {args.scenario}')
+
     # Create worker agents
     for i in range(args.num_agents):
         name = f"worker_{i}"
@@ -101,7 +226,7 @@ def run_simulation(args):
         agents.append(agent)
     
     # Initialize tax planner
-    if args.planner_type == 'LLM':
+    if planner_type == 'LLM':
         planner_history = args.history_len
         if args.num_agents > 20:
             planner_history = args.history_len//(args.num_agents) * 20
@@ -109,10 +234,14 @@ def run_simulation(args):
         tax_planner = TaxPlanner(args.llm, args.port, 'Joe', 
                                  history_len=planner_history, prompt_algo=args.prompt_algo, 
                                  max_timesteps=args.max_timesteps, num_agents=args.num_agents, args=args)
-    elif args.planner_type in ['US_FED', 'SAEZ', 'SAEZ_FLAT', 'SAEZ_THREE', 'UNIFORM']:
-        tax_planner = FixedTaxPlanner('Joe', args.planner_type, history_len=args.history_len, skills=skills, args=args)
+    elif planner_type in ['US_FED', 'SAEZ', 'SAEZ_FLAT', 'SAEZ_THREE', 'UNIFORM']:
+        tax_planner = FixedTaxPlanner('Joe', planner_type, history_len=args.history_len, skills=skills, args=args)
+    elif planner_type == 'FIXED':
+        tax_planner = FixedTaxPlanner('Joe', 'US_FED', history_len=args.history_len, skills=skills, args=args)
+    else:
+        raise ValueError(f'Unknown planner type: {planner_type}')
     tax_rates = tax_planner.tax_rates
-    
+
     # Initialize wandb logging
     if args.wandb:
         experiment_name = generate_experiment_name(args)
@@ -124,12 +253,26 @@ def run_simulation(args):
     
     start_time = time.time()
 
+    history_resume_step = getattr(args, 'history_jsonl_step', None)
+    start_timestep = 0
     wandb_step_offset = 0
-    if getattr(args, 'history_jsonl_step', None) is not None:
+    if history_resume_step is not None:
         try:
-            wandb_step_offset = max(0, int(args.history_jsonl_step) + 1)
+            history_resume_step = max(0, int(history_resume_step))
+            if history_resume_step > args.max_timesteps:
+                history_resume_step = args.max_timesteps
+            start_timestep = history_resume_step
+            wandb_step_offset = start_timestep
         except (TypeError, ValueError):
-            wandb_step_offset = 0
+            history_resume_step = None
+
+    if start_timestep >= args.max_timesteps:
+        logger.info(
+            "Requested resume step %s is beyond max timesteps %s; nothing to execute.",
+            start_timestep,
+            args.max_timesteps,
+        )
+        return
 
     llm_entities = [
         agent for agent in agents
@@ -138,12 +281,41 @@ def run_simulation(args):
     if isinstance(tax_planner, LLMAgent) and getattr(tax_planner, 'llm', None) is not None:
         llm_entities.append(tax_planner)
 
+    metadata_target = getattr(args, 'history_jsonl_save', None) or getattr(args, 'history_jsonl_load', None)
+
+    def write_metadata(latest_step: int) -> None:
+        if not metadata_target:
+            return
+
+        agent_states = {
+            entity.name: entity.export_resume_state()
+            for entity in llm_entities
+        }
+        payload = {
+            "args": vars(args),
+            "skills": skills,
+            "utility_types": utility_types,
+            "personas": personas,
+            "latest_step": latest_step,
+            "agents": agent_states,
+        }
+        save_simulation_metadata(metadata_target, payload)
+
+    if loaded_metadata:
+        agent_state_payload = loaded_metadata.get("agents", {})
+        for entity in llm_entities:
+            if entity.name in agent_state_payload:
+                entity.load_resume_state(agent_state_payload[entity.name])
+
     def save_histories_if_due(timestep: int, *, force: bool = False) -> None:
         for entity in llm_entities:
             entity.maybe_save_history(timestep, force=force)
+        write_metadata(timestep)
+
+    write_metadata(start_timestep - 1)
 
     # Main simulation loop
-    for k in range(args.max_timesteps):
+    for k in range(start_timestep, args.max_timesteps):
         logger.info(f"TIMESTEP {k}")
         print(f"TIMESTEP {k}")
         
@@ -222,12 +394,36 @@ def run_simulation(args):
             for i in range(args.num_agents):
                 agents[i].act(k, tax_rates, planner_state)
 
-        pre_tax_incomes = [agents[i].z for i in range(args.num_agents)]
+        pre_tax_incomes = []
+        for agent in agents:
+            value = getattr(agent, 'z', 0)
+            try:
+                pre_tax_incomes.append(float(value))
+            except (TypeError, ValueError):
+                pre_tax_incomes.append(0.0)
         
         # Calculate taxes
-        post_tax_incomes, total_tax = tax_planner.apply_taxes(tax_rates, pre_tax_incomes)
+        tax_result = tax_planner.apply_taxes(tax_rates, pre_tax_incomes)
+        if isinstance(tax_result, tuple) and len(tax_result) == 2:
+            post_raw, total_tax = tax_result
+        else:
+            post_raw = pre_tax_incomes
+            total_tax = 0
+
+        post_tax_incomes = []
+        for value in post_raw:
+            try:
+                post_tax_incomes.append(float(value))
+            except (TypeError, ValueError):
+                post_tax_incomes.append(0.0)
+
+        try:
+            total_tax = float(total_tax)
+        except (TypeError, ValueError):
+            total_tax = 0.0
+
         tax_indv = np.array(pre_tax_incomes) - np.array(post_tax_incomes)
-        tax_rebate_avg = total_tax / args.num_agents
+        tax_rebate_avg = total_tax / max(1, args.num_agents)
         
         # Update agent utilities
         for i, agent in enumerate(agents):
@@ -277,38 +473,49 @@ def run_simulation(args):
 def generate_experiment_name(args):
     """Generate a descriptive experiment name."""
     # Start with scenario and number of agents as base
-    name_parts = [f"{args.scenario}"]
-    name_parts.append(f"a{args.num_agents}")
-    
+    scenario = getattr(args, 'scenario', 'rational')
+    num_agents = getattr(args, 'num_agents', 0)
+    name_parts = [f"{scenario}"]
+    name_parts.append(f"a{num_agents}")
+
     # Add agent composition if not all egotistical
-    if args.percent_ego != 100:
-        name_parts.append(f"mix_e{args.percent_ego}_a{args.percent_alt}_d{args.percent_adv}")
-    
+    percent_ego = getattr(args, 'percent_ego', 100)
+    percent_alt = getattr(args, 'percent_alt', 0)
+    percent_adv = getattr(args, 'percent_adv', 0)
+    if percent_ego != 100:
+        name_parts.append(f"mix_e{percent_ego}_a{percent_alt}_d{percent_adv}")
+        name_parts.extend([
+            f"ego{percent_ego}",
+            f"alt{percent_alt}",
+            f"adv{percent_adv}",
+        ])
+
     # Add worker and planner types
-    name_parts.append(f"w-{args.worker_type}")
-    name_parts.append(f"p-{args.planner_type}")
-    
+    name_parts.append(f"w-{getattr(args, 'worker_type', 'LLM')}")
+    name_parts.append(f"p-{getattr(args, 'planner_type', 'LLM')}")
+
     # Add LLM model (shortened)
-    llm_name = args.llm.replace("llama3:", "l3-").replace("gpt-", "g").replace("-mini-2024-07-18", "m")
+    llm_value = getattr(args, 'llm', 'gpt-4o-mini')
+    llm_name = llm_value.replace("llama3:", "l3-").replace("gpt-", "g").replace("-mini-2024-07-18", "m")
     name_parts.append(f"llm-{llm_name}")
-    
+
     # Add prompting algorithm
-    name_parts.append(f"prompt-{args.prompt_algo}")
-    
+    name_parts.append(f"prompt-{getattr(args, 'prompt_algo', 'io')}")
+
     # Add timescale and history length
-    name_parts.append(f"ts{args.two_timescale}")
-    name_parts.append(f"hist{args.history_len}")
-    
+    name_parts.append(f"ts{getattr(args, 'two_timescale', 1)}")
+    name_parts.append(f"hist{getattr(args, 'history_len', 0)}")
+
     # Add max timesteps
-    name_parts.append(f"steps{args.max_timesteps}")
-    
+    name_parts.append(f"steps{getattr(args, 'max_timesteps', 0)}")
+
     # Add bracket setting
-    name_parts.append(f"bracket-{args.bracket_setting}")
-    
+    name_parts.append(f"bracket-{getattr(args, 'bracket_setting', 'two')}")
+
     # Add voting indicator if using platforms
-    if args.platforms:
+    if getattr(args, 'platforms', False):
         name_parts.append("voting")
-    
+
     # Join all parts with underscores
     return "_".join(name_parts)
 
@@ -331,7 +538,7 @@ def create_argument_parser():
                         help='Save history every N timesteps; 0 disables periodic saves')
     parser.add_argument('--two-timescale', type=int, default=25, help='Interval for two-timescale updates')
     parser.add_argument('--debug', type=bool, default=True, help='Enable debug mode') 
-    parser.add_argument('--llm', default='llama3:8b', type=str, help='Language model to use')
+    parser.add_argument('--llm', default='gpt-4o-mini', type=str, help='Language model to use')
     parser.add_argument('--prompt-algo', default='io', choices=['io', 'cot'], help='Prompting algorithm to use')
     parser.add_argument('--scenario', default='rational', choices=['rational', 'bounded', 'democratic'], help='Scenario')
     parser.add_argument('--percent-ego', type=int, default=100)
